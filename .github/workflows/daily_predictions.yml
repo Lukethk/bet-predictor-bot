@@ -1,0 +1,32 @@
+name: Pronosticos Diarios
+
+on:
+  schedule:
+    # Se ejecuta todos los días a las 00:00 UTC (20:00 hora de Bolivia)
+    - cron: '0 0 * * *'
+  workflow_dispatch: # Habilita el botón para correrlo manualmente cuando quieras
+
+jobs:
+  analizar-partidos:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar código del repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Ejecutar Motor de Pronósticos
+        env:
+          FOOTBALL_API_KEY: ${{ secrets.FOOTBALL_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python main.py
