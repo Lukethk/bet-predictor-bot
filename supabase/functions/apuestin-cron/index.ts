@@ -13,7 +13,11 @@ function poissonPmf(k: number, lambda: number): number {
   return (Math.pow(lambda, k) * Math.exp(-lambda)) / factorial(k);
 }
 
-function calcularTop3Poisson(lambdaLocal: number, lambdaVisita: number) {
+function calcularTop3Poisson(
+  lambdaLocal: number,
+  lambdaVisita: number,
+  stakeBs: number
+) {
   const maxGoles = 6;
   const matriz: number[][] = Array.from({ length: maxGoles }, () =>
     Array(maxGoles).fill(0)
@@ -74,6 +78,7 @@ function calcularTop3Poisson(lambdaLocal: number, lambdaVisita: number) {
       probabilidad: Number((prob * 100).toFixed(1)),
       cuota_aprox: Math.max(1.05, cuotaAproxCasa),
       cuota_justa: cuotaJusta,
+      stake_bs: stakeBs,
     };
   });
 }
@@ -215,6 +220,14 @@ function formatearHoraBo(isoUtc: string): string {
   return `${dd}/${mm} ${hh}:${min}`;
 }
 
+function csvEscape(val: unknown): string {
+  const s = String(val ?? "").replace(/"/g, '""');
+  if (s.includes(",") || s.includes('"') || s.includes("\n")) {
+    return `"${s}"`;
+  }
+  return s;
+}
+
 async function enviarTelegram(
   token: string,
   chatId: string,
@@ -250,6 +263,114 @@ Deno.serve(async (req: Request) => {
   const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
   const sb = createClient(supabaseUrl, supabaseServiceKey);
 
+  const reqUrl = new URL(req.url);
+
+  // ENDPOINT GET PARA GOOGLE SHEETS (=IMPORTDATA) — 100% AUTOMÁTICO EN LA NUBE
+  if (req.method === "GET" && reqUrl.searchParams.get("format") === "csv") {
+    const stakeParam = Number(reqUrl.searchParams.get("stake") || "0");
+    const modoParam = (reqUrl.searchParams.get("modo") || "").toUpperCase();
+
+    const { data: cfg } = await sb
+      .from("configuracion_apuestin")
+      .select("*")
+      .eq("id", 1)
+      .single();
+
+    let stakeActual = Number(cfg?.stake_fijo_bs ?? 3.0);
+    let modoActual = String(cfg?.modo_mercados ?? "TOP_3").toUpperCase();
+
+    // Si el usuario cambió B3 (stake) o B4 (modo) en Google Sheets, sincronizar a Supabase automáticamente
+    const updatesCfg: Record<string, unknown> = {};
+    if (stakeParam > 0 && stakeParam !== stakeActual) {
+      stakeActual = stakeParam;
+      updatesCfg.stake_fijo_bs = stakeParam;
+    }
+    if (
+      (modoParam === "TOP_1" || modoParam === "TOP_3") &&
+      modoParam !== modoActual
+    ) {
+      modoActual = modoParam;
+      updatesCfg.modo_mercados = modoParam;
+    }
+    if (Object.keys(updatesCfg).length > 0) {
+      updatesCfg.actualizado_en = new Date().toISOString();
+      await sb.from("configuracion_apuestin").update(updatesCfg).eq("id", 1);
+    }
+
+    const { data: partidos } = await sb
+      .from("pronosticos_diarios")
+      .select("*")
+      .order("fecha_partido", { ascending: true })
+      .order("id", { ascending: true });
+
+    const csvRows: string[] = [];
+    for (const p of partidos || []) {
+      const horaBo = formatearHoraBo(p.fecha_partido);
+      const todosMercados: any[] = p.top_3_mercados || [];
+      const mercados =
+        modoActual === "TOP_1" ? todosMercados.slice(0, 1) : todosMercados;
+      const finalizado =
+        p.estado === "FINALIZADO" &&
+        p.goles_local_real !== null &&
+        p.goles_visita_real !== null;
+      const marcadorFt = finalizado
+        ? `${p.goles_local_real} - ${p.goles_visita_real}`
+        : "-";
+
+      mercados.forEach((m: any, idx: number) => {
+        const betId = `${p.match_id}-${idx + 1}`;
+        const cuota = Number(m.cuota_aprox || 1.0);
+        const prob = Number(m.probabilidad || 0);
+        // Si el partido ya finalizó, se respeta el stake histórico con el que se jugó; si está pendiente, usa el stake actual
+        const stakeFila = finalizado
+          ? Number(m.stake_bs ?? stakeActual)
+          : stakeActual;
+        const gananciaPotencial = Number((stakeFila * (cuota - 1)).toFixed(2));
+
+        let estadoFila = "PENDIENTE";
+        let balanceNeto = 0;
+        if (finalizado) {
+          estadoFila =
+            m.resultado ||
+            evaluarMercado(
+              m.mercado,
+              Number(p.goles_local_real),
+              Number(p.goles_visita_real)
+            );
+          balanceNeto =
+            estadoFila === "GANADA"
+              ? gananciaPotencial
+              : -Number(stakeFila.toFixed(2));
+        }
+
+        const row = [
+          betId,
+          horaBo,
+          p.liga,
+          `${p.equipo_local} vs ${p.equipo_visita}`,
+          m.mercado,
+          prob,
+          cuota,
+          stakeFila,
+          gananciaPotencial,
+          estadoFila,
+          marcadorFt,
+          balanceNeto,
+        ].map(csvEscape);
+
+        csvRows.push(row.join(","));
+      });
+    }
+
+    return new Response(csvRows.join("\n"), {
+      status: 200,
+      headers: {
+        "Content-Type": "text/csv; charset=utf-8",
+        "Cache-Control": "no-store, max-age=0",
+      },
+    });
+  }
+
   let body: any = {};
   if (req.method === "POST") {
     try {
@@ -268,13 +389,15 @@ Deno.serve(async (req: Request) => {
     });
   }
 
-  const footballApiKey = body.football_api_key || Deno.env.get("FOOTBALL_API_KEY") || "";
-  const telegramToken = body.telegram_token || Deno.env.get("TELEGRAM_TOKEN") || "";
-  const telegramChatId = body.telegram_chat_id || Deno.env.get("TELEGRAM_CHAT_ID") || "";
-  const mode = body.mode || "both"; // 'verify', 'predict', or 'both'
+  const footballApiKey =
+    body.football_api_key || Deno.env.get("FOOTBALL_API_KEY") || "";
+  const telegramToken =
+    body.telegram_token || Deno.env.get("TELEGRAM_TOKEN") || "";
+  const telegramChatId =
+    body.telegram_chat_id || Deno.env.get("TELEGRAM_CHAT_ID") || "";
+  const mode = body.mode || "both";
   const silent = Boolean(body.silent);
 
-  // Leer configuración de stake_fijo_bs desde configuracion_apuestin
   const { data: cfg } = await sb
     .from("configuracion_apuestin")
     .select("*")
@@ -327,7 +450,12 @@ Deno.serve(async (req: Request) => {
 
         const golesL = datosM.score?.fullTime?.home;
         const golesV = datosM.score?.fullTime?.away;
-        if (golesL === null || golesL === undefined || golesV === null || golesV === undefined) {
+        if (
+          golesL === null ||
+          golesL === undefined ||
+          golesV === null ||
+          golesV === undefined
+        ) {
           continue;
         }
 
@@ -339,22 +467,25 @@ Deno.serve(async (req: Request) => {
           const m = reg.top_3_mercados[idx];
           const estadoM = evaluarMercado(m.mercado, golesL, golesV);
           const cuota = Number(m.cuota_aprox || 1.0);
+          const stakeUsado = Number(m.stake_bs ?? stakeBs);
           const balanceM =
             estadoM === "GANADA"
-              ? Number((stakeBs * (cuota - 1)).toFixed(2))
-              : -Number(stakeBs.toFixed(2));
+              ? Number((stakeUsado * (cuota - 1)).toFixed(2))
+              : -Number(stakeUsado.toFixed(2));
           gananciaNetaTotal += balanceM;
           totalEvaluados++;
           if (estadoM === "GANADA") aciertos++;
 
           const icono = estadoM === "GANADA" ? "✅" : "❌";
           const signo =
-            balanceM >= 0 ? `+${balanceM.toFixed(2)} Bs` : `${balanceM.toFixed(2)} Bs`;
+            balanceM >= 0
+              ? `+${balanceM.toFixed(2)} Bs`
+              : `${balanceM.toFixed(2)} Bs`;
 
           mercadosActualizados.push({
             ...m,
             resultado: estadoM,
-            stake_bs: stakeBs,
+            stake_bs: stakeUsado,
             balance_bs: balanceM,
           });
           lineasMercados.push(
@@ -470,7 +601,7 @@ Deno.serve(async (req: Request) => {
           if (!lambdas) continue;
 
           const [lambdaL, lambdaV] = lambdas;
-          const top3 = calcularTop3Poisson(lambdaL, lambdaV);
+          const top3 = calcularTop3Poisson(lambdaL, lambdaV, stakeBs);
 
           await sb.from("pronosticos_diarios").upsert(
             {
