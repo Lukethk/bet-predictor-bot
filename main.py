@@ -6,6 +6,7 @@ import numpy as np
 from scipy.stats import poisson
 from datetime import datetime, timedelta, timezone
 from supabase import create_client
+from sheets_sync import obtener_config_sheet, sincronizar_apuestas_nuevas
 
 
 def cargar_dotenv_local():
@@ -229,8 +230,14 @@ def main():
         return
 
     tablas_cache = {}
-    lineas_mensaje = [f"📊 *PRONÓSTICOS PRÓXIMAS 24H*\n🕒 _{rango_texto}_\n"]
+    stake_bs, modo_sheet = obtener_config_sheet()
+    lineas_mensaje = [
+        f"📊 *PRONÓSTICOS PRÓXIMAS 24H*\n"
+        f"🕒 _{rango_texto}_\n"
+        f"💵 _Stake Fijo en Sheet: {stake_bs:.2f} Bs ({modo_sheet})_\n"
+    ]
     partidos_procesados = 0
+    apuestas_para_sheet = []
 
     for p in partidos:
         liga_code = p["competition"]["code"]
@@ -286,10 +293,21 @@ def main():
 
         lineas_mensaje.append(bloque)
         partidos_procesados += 1
+        apuestas_para_sheet.append({
+            "match_id": p["id"],
+            "hora_bo": hora_bo,
+            "liga": liga_nombre,
+            "equipo_local": p["homeTeam"]["name"],
+            "equipo_visita": p["awayTeam"]["name"],
+            "top_3": top_3
+        })
 
     if partidos_procesados > 0:
+        nuevas_en_sheet = sincronizar_apuestas_nuevas(apuestas_para_sheet)
+        if nuevas_en_sheet > 0:
+            lineas_mensaje.append(f"📝 _Se anotaron {nuevas_en_sheet} apuestas nuevas en Google Sheets ({stake_bs:.2f} Bs c/u)._")
         enviar_telegram("\n".join(lineas_mensaje))
-        print(f"Se procesaron y enviaron {partidos_procesados} partidos.")
+        print(f"Se procesaron y enviaron {partidos_procesados} partidos ({nuevas_en_sheet} filas nuevas en Google Sheets).")
     else:
         enviar_telegram(f"⚠️ Hay partidos en las próximas 24h ({rango_texto}), pero aún no tienen suficientes estadísticas en liga.")
         print("Partidos encontrados pero sin suficientes estadísticas.")
