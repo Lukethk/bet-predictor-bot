@@ -36,6 +36,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 BASE_URL = "https://api.football-data.org/v4"
 HEADERS = {"X-Auth-Token": FOOTBALL_API_KEY}
+MAX_PARTIDOS_POR_JORNADA = 3
 
 
 def resolver_chat_id() -> str:
@@ -200,9 +201,9 @@ def main():
     limite_bo = limite_utc.astimezone(tz_bo)
     rango_texto = f"{ahora_bo.strftime('%d/%m %H:%M')} a {limite_bo.strftime('%d/%m %H:%M')} (BO)"
 
-    # Consultar API en el rango de fechas UTC que cubren las próximas 24h
+    # Consultar API en el rango de fechas UTC que cubren las próximas 24h (+1 día por dateTo exclusivo)
     date_from = ahora_utc.strftime("%Y-%m-%d")
-    date_to = limite_utc.strftime("%Y-%m-%d")
+    date_to = (limite_utc + timedelta(days=1)).strftime("%Y-%m-%d")
 
     res = requests.get(
         f"{BASE_URL}/matches",
@@ -230,14 +231,8 @@ def main():
         return
 
     tablas_cache = {}
-    stake_bs, modo_sheet = obtener_config_sheet()
-    lineas_mensaje = [
-        f"📊 *PRONÓSTICOS PRÓXIMAS 24H*\n"
-        f"🕒 _{rango_texto}_\n"
-        f"💵 _Stake Fijo en Sheet: {stake_bs:.2f} Bs ({modo_sheet})_\n"
-    ]
-    partidos_procesados = 0
-    apuestas_para_sheet = []
+    stake_bs, _ = obtener_config_sheet()
+    candidatos = []
 
     for p in partidos:
         liga_code = p["competition"]["code"]
@@ -266,6 +261,35 @@ def main():
 
         lambda_l, lambda_v = lambdas
         top_3 = calcular_top_3_poisson(lambda_l, lambda_v)
+        confianza_media = sum(m["probabilidad"] for m in top_3) / len(top_3)
+
+        candidatos.append({
+            "partido": p,
+            "liga_nombre": liga_nombre,
+            "lambda_l": lambda_l,
+            "lambda_v": lambda_v,
+            "top_3": top_3,
+            "confianza_media": confianza_media,
+        })
+
+    # Seleccionar solo los TOP 3 partidos con mayor probabilidad promedio en sus 3 mercados
+    top_partidos = sorted(candidatos, key=lambda x: x["confianza_media"], reverse=True)[:MAX_PARTIDOS_POR_JORNADA]
+    top_partidos.sort(key=lambda x: x["partido"]["utcDate"])
+
+    lineas_mensaje = [
+        f"📊 *TOP {len(top_partidos)} PARTIDOS PRÓXIMAS 24H (3 Probables c/u)*\n"
+        f"🕒 _{rango_texto}_\n"
+        f"💵 _Stake Fijo en Sheet: {stake_bs:.2f} Bs_\n"
+    ]
+    partidos_procesados = 0
+    apuestas_para_sheet = []
+
+    for item in top_partidos:
+        p = item["partido"]
+        liga_nombre = item["liga_nombre"]
+        lambda_l = item["lambda_l"]
+        lambda_v = item["lambda_v"]
+        top_3 = item["top_3"]
 
         # Guardar pronóstico en Supabase
         registro = {

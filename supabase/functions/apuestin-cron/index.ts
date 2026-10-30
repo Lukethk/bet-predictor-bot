@@ -2,6 +2,7 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2";
 
 const BASE_URL = "https://api.football-data.org/v4";
+const MAX_PARTIDOS_POR_JORNADA = 3;
 
 function factorial(n: number): number {
   let res = 1;
@@ -265,7 +266,7 @@ Deno.serve(async (req: Request) => {
 
   const reqUrl = new URL(req.url);
 
-  // ENDPOINT GET PARA GOOGLE SHEETS (=IMPORTDATA) — 100% AUTOMÁTICO EN LA NUBE
+  // ENDPOINT GET PARA GOOGLE SHEETS (=IMPORTDATA)
   if (req.method === "GET" && reqUrl.searchParams.get("format") === "csv") {
     const stakeParam = Number(reqUrl.searchParams.get("stake") || "0");
     const modoParam = (reqUrl.searchParams.get("modo") || "").toUpperCase();
@@ -279,7 +280,6 @@ Deno.serve(async (req: Request) => {
     let stakeActual = Number(cfg?.stake_fijo_bs ?? 3.0);
     let modoActual = String(cfg?.modo_mercados ?? "TOP_3").toUpperCase();
 
-    // Si el usuario cambió B3 (stake) o B4 (modo) en Google Sheets, sincronizar a Supabase automáticamente
     const updatesCfg: Record<string, unknown> = {};
     if (stakeParam > 0 && stakeParam !== stakeActual) {
       stakeActual = stakeParam;
@@ -300,13 +300,14 @@ Deno.serve(async (req: Request) => {
     const { data: partidos } = await sb
       .from("pronosticos_diarios")
       .select("*")
+      .in("estado", ["PENDIENTE", "FINALIZADO"])
       .order("fecha_partido", { ascending: true })
       .order("id", { ascending: true });
 
     const csvRows: string[] = [];
     for (const p of partidos || []) {
       const horaBo = formatearHoraBo(p.fecha_partido);
-      const todosMercados: any[] = p.top_3_mercados || [];
+      const todosMercados: any[] = (p.top_3_mercados || []).slice(0, 3);
       const mercados =
         modoActual === "TOP_1" ? todosMercados.slice(0, 1) : todosMercados;
       const finalizado =
@@ -321,7 +322,6 @@ Deno.serve(async (req: Request) => {
         const betId = `${p.match_id}-${idx + 1}`;
         const cuota = Number(m.cuota_aprox || 1.0);
         const prob = Number(m.probabilidad || 0);
-        // Si el partido ya finalizó, se respeta el stake histórico con el que se jugó; si está pendiente, usa el stake actual
         const stakeFila = finalizado
           ? Number(m.stake_bs ?? stakeActual)
           : stakeActual;
@@ -411,25 +411,22 @@ Deno.serve(async (req: Request) => {
   let verificadosCount = 0;
   let pronosticadosCount = 0;
 
-  // 1. VERIFICAR PARTIDOS PENDIENTES
+  // 1. VERIFICAR PARTIDOS PENDIENTES USANDO ?ids=...
   if (mode === "verify" || mode === "both") {
+    const hace100Min = new Date(Date.now() - 100 * 60 * 1000).toISOString();
     const { data: pendientes } = await sb
       .from("pronosticos_diarios")
       .select("*")
       .eq("estado", "PENDIENTE")
+      .lte("fecha_partido", hace100Min)
       .order("fecha_partido", { ascending: true });
 
     if (pendientes && pendientes.length > 0) {
-      const fechas = pendientes.map((p: any) =>
-        new Date(p.fecha_partido).toISOString().slice(0, 10)
-      );
-      const dateFrom = fechas.reduce((a: string, b: string) => (a < b ? a : b));
-      const dateTo = fechas.reduce((a: string, b: string) => (a > b ? a : b));
+      const idsCsv = pendientes.map((p: any) => p.match_id).join(",");
+      const rApi = await fetch(`${BASE_URL}/matches?ids=${idsCsv}`, {
+        headers,
+      });
 
-      const rApi = await fetch(
-        `${BASE_URL}/matches?dateFrom=${dateFrom}&dateTo=${dateTo}`,
-        { headers }
-      );
       const partidosMap: Record<number, any> = {};
       if (rApi.ok) {
         const json = await rApi.json();
@@ -539,17 +536,19 @@ Deno.serve(async (req: Request) => {
     }
   }
 
-  // 2. PRONOSTICAR PARTIDOS DE LAS PRÓXIMAS 24 HORAS
+  // 2. PRONOSTICAR TOP 3 PARTIDOS DE LAS PRÓXIMAS 24 HORAS (3 PROBABLES POR PARTIDO)
   if (mode === "predict" || mode === "both") {
     const ahoraUtc = new Date();
     const limiteUtc = new Date(ahoraUtc.getTime() + 24 * 3600 * 1000);
+    // Sumamos 1 día extra a dateTo porque la API de Football-Data toma dateTo exclusivo cuando dateFrom != dateTo
+    const dateToApi = new Date(limiteUtc.getTime() + 24 * 3600 * 1000)
+      .toISOString()
+      .slice(0, 10);
+    const dateFrom = ahoraUtc.toISOString().slice(0, 10);
     const rangoTexto = `${formatearHoraBo(ahoraUtc.toISOString())} a ${formatearHoraBo(limiteUtc.toISOString())} (BO)`;
 
-    const dateFrom = ahoraUtc.toISOString().slice(0, 10);
-    const dateTo = limiteUtc.toISOString().slice(0, 10);
-
     const resMatches = await fetch(
-      `${BASE_URL}/matches?dateFrom=${dateFrom}&dateTo=${dateTo}`,
+      `${BASE_URL}/matches?dateFrom=${dateFrom}&dateTo=${dateToApi}`,
       { headers }
     );
 
@@ -572,10 +571,7 @@ Deno.serve(async (req: Request) => {
         }
       } else {
         const tablasCache: Record<string, any> = {};
-        const lineasMensaje = [
-          `📊 *PRONÓSTICOS PRÓXIMAS 24H*\n🕒 _${rangoTexto}_\n💵 _Stake Fijo: ${stakeBs.toFixed(2)} Bs (${modoMercados})_\n`,
-        ];
-        const apuestasSheet: any[] = [];
+        const candidatos: any[] = [];
 
         for (const p of partidos) {
           const ligaCode = p.competition.code;
@@ -602,6 +598,37 @@ Deno.serve(async (req: Request) => {
 
           const [lambdaL, lambdaV] = lambdas;
           const top3 = calcularTop3Poisson(lambdaL, lambdaV, stakeBs);
+          const confianzaMedia =
+            top3.reduce((acc: number, m: any) => acc + m.probabilidad, 0) /
+            top3.length;
+
+          candidatos.push({
+            partido: p,
+            ligaNombre,
+            lambdaL,
+            lambdaV,
+            top3,
+            confianzaMedia,
+          });
+        }
+
+        // Seleccionar únicamente los TOP 3 partidos con mayor probabilidad promedio en sus 3 mercados
+        const topPartidos = candidatos
+          .sort((a, b) => b.confianzaMedia - a.confianzaMedia)
+          .slice(0, MAX_PARTIDOS_POR_JORNADA)
+          .sort(
+            (a, b) =>
+              new Date(a.partido.utcDate).getTime() -
+              new Date(b.partido.utcDate).getTime()
+          );
+
+        const lineasMensaje = [
+          `📊 *TOP ${topPartidos.length} PARTIDOS PRÓXIMAS 24H (3 Probables c/u)*\n🕒 _${rangoTexto}_\n💵 _Stake Fijo: ${stakeBs.toFixed(2)} Bs_\n`,
+        ];
+        const apuestasSheet: any[] = [];
+
+        for (const item of topPartidos) {
+          const { partido: p, ligaNombre, lambdaL, lambdaV, top3 } = item;
 
           await sb.from("pronosticos_diarios").upsert(
             {
@@ -646,7 +673,7 @@ Deno.serve(async (req: Request) => {
                 body: JSON.stringify({
                   action: "append_bets",
                   stake_bs: stakeBs,
-                  modo: modoMercados,
+                  modo: "TOP_3",
                   partidos: apuestasSheet,
                 }),
               });

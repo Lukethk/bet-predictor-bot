@@ -31,18 +31,13 @@ def main():
         print("ℹ️ No hay partidos pendientes de verificar en Supabase.")
         return
 
-    # 2. Consultar resultados en Football-Data.org agrupando por rango de fechas
-    fechas = [
-        datetime.fromisoformat(p["fecha_partido"].replace("Z", "+00:00")).strftime("%Y-%m-%d")
-        for p in pendientes
-    ]
-    date_from = min(fechas)
-    date_to = max(fechas)
+    # 2. Consultar resultados en Football-Data.org por lista de IDs
+    ids_csv = ",".join(str(p["match_id"]) for p in pendientes)
 
     r_api = requests.get(
         f"{BASE_URL}/matches",
         headers=HEADERS,
-        params={"dateFrom": date_from, "dateTo": date_to}
+        params={"ids": ids_csv}
     )
 
     partidos_api = {}
